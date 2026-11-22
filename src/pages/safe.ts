@@ -26,6 +26,7 @@ import * as Drive from "../serial/drive";
 import type { Repl } from "../serial/repl";
 import * as E from "../safe/eth";
 import { ownSigs } from "../safe/signer";
+import { PUBLIC_RPC } from "../safe/public-rpc";
 import { realSafe } from "../safe/real";
 import { knownModule, modulePage } from "../safe/modules";
 import { address, addressInput, addressOf, face, watch } from "../safe/address";
@@ -90,11 +91,17 @@ const SIM_URL = "https://sim.wedgie.dev";
 
 // Safe's service goes through /api/safe (our key: without one Safe allows 5,000 reads a month per IP, and one person's
 // page used that up, 10-21), at most 3 at a time (the key: 5 a second). A local preview has no /api: straight there.
+// A static clone (no Vercel /api) also goes straight there, once a proxy call comes back 404 or non-JSON (Apache's
+// FallbackResource is often 200 HTML). The official site keeps using the proxy: we only flip after that miss.
 const SAFE = "https://api.safe.global/tx-service/";
+/** A real /api response is JSON. A static host's FallbackResource is HTML (often 200) or 404. */
+const jsonApi = (r: Response) => r.status !== 404 && r.status !== 405 && (r.headers.get("content-type") || "").includes("json");
+const isLocal = () => /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+let viaApi = !isLocal();
 // q: more for /api/safe (&v=<version> keeps an answer for everyone till the version changes, &fresh=1 asks Safe again)
 const via = (url: string, q = "") => {
   const fresh = url.endsWith("?fresh"), u = fresh ? url.slice(0, -6) : url;
-  return u.startsWith(SAFE) && !/^(localhost|127\.0\.0\.1)$/.test(location.hostname)
+  return u.startsWith(SAFE) && viaApi
     ? `${location.origin}/api/safe?u=${encodeURIComponent(u.slice(SAFE.length))}${fresh ? "&fresh=1" : ""}${q}` : u;
 };
 /** Our daily share of Safe's service is used (/api/safe's 429): the rest comes from the chain till tomorrow. */
@@ -104,7 +111,11 @@ const safeWait: (() => void)[] = [];
 async function safeFetch(url: string, init?: RequestInit, q = "") {
   if (safeBusy >= 3) await new Promise<void>((r) => safeWait.push(r));
   safeBusy++;
-  try { return await fetch(via(url, q), init); } finally { safeBusy--; safeWait.shift()?.(); }
+  try {
+    let r = await fetch(via(url, q), init);
+    if (viaApi && !jsonApi(r)) { viaApi = false; r = await fetch(via(url, q), init); }
+    return r;
+  } finally { safeBusy--; safeWait.shift()?.(); }
 }
 async function get(url: string, q = "") {
   const r = await safeFetch(url, undefined, q);
@@ -119,7 +130,12 @@ async function post(url: string, body: unknown) {
 }
 
 // ---- the chain, read through /api/rpc (the shop's Alchemy key; no wallet needed) ----
-const readUrl = (chain: number) => `${location.origin}/api/rpc?chain=${chain}`;
+// A static clone has no /api/rpc: after a 404 or non-JSON answer, reads go to each chain's public RPC (PUBLIC_RPC).
+// Official /api/rpc stays in use. Alchemy-only methods then fail, and assets.ts already falls back to the coin
+// and USDC, no dollars.
+let rpcApi = true;
+const publicRpc = (chain: number) => PUBLIC_RPC[chain] || CHAINS[chain].rpc;
+const readUrl = (chain: number) => rpcApi ? `${location.origin}/api/rpc?chain=${chain}` : publicRpc(chain);
 let rpcId = 0;
 // /api/rpc down (Vercel or Alchemy): the connected wallet's own RPC, when it's on that chain. Standard reads only
 // (no alchemy_ or wedgie_ methods). For a minute after a failure, that chain's reads go to the wallet first.
@@ -136,12 +152,14 @@ async function rpc(chain: number, method: string, params: unknown[]): Promise<an
     try {
       const res = await fetch(readUrl(chain), { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method, params }) });
+      if (rpcApi && !jsonApi(res)) { rpcApi = false; i--; continue; }
       // 429: /api/rpc's own limit ("Too many reads") or Alchemy's ("Busy."): say which
       if (res.status === 429 || res.status >= 500) throw Object.assign(new Error(`${CHAINS[chain].name}: ${(await res.json().catch(() => null))?.error || "busy"} (${res.status})`), { again: true });
       const r = await res.json();
       if (r.error) throw new Error(`${CHAINS[chain].name}: ${r.error.message || r.error}`);    // a JSON-RPC error, or /api/rpc's own
       return r.result;
     } catch (e: any) {
+      if (rpcApi && e instanceof SyntaxError) { rpcApi = false; i--; continue; }
       // TypeError: the fetch itself failed. ~80 s of tries: /api/rpc's limit is per minute
       if (i >= 8 || !(e.again || e instanceof TypeError)) throw e;
       if (!rpcDown[chain] || Date.now() - rpcDown[chain] >= 60_000) {
@@ -199,7 +217,7 @@ function tellOurs(c: number, a: string) {
   tellTimer = window.setTimeout(() => {
     const go = toTell.splice(0, 20);
     fetch("/api/safes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ safes: go }) }).then((r) => {
-      if (!r.ok) return;
+      if (!r.ok || !jsonApi(r)) return;
       try { const t = JSON.parse(localStorage.getItem(TOLD) || "{}"); for (const x of go) t[`${x.chain}:${x.safe.toLowerCase()}`] = Date.now(); localStorage.setItem(TOLD, JSON.stringify(t)); } catch {}
     }).catch(() => {});
   }, 1500);
@@ -740,7 +758,7 @@ export function safe(main: HTMLElement) {
     takeLink(chain, safeAddr, code);
   }
   window.addEventListener("hashchange", linkIn);
-  watch(main, readUrl(1));   // ENS names and avatars on every address, from Ethereum
+  watch(main, [readUrl(1), publicRpc(1)]);   // ENS names and avatars on every address, from Ethereum
   main.addEventListener("click", (e) => {        // in-page links: no reload, the wedgie stays read
     const a = (e.target as HTMLElement).closest?.("a[data-nav]") as HTMLAnchorElement | null;
     if (!a || e.metaKey || e.ctrlKey) return;

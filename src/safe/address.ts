@@ -211,16 +211,21 @@ function fill(root: ParentNode) {
   root.querySelectorAll<HTMLInputElement>(".addr-in input").forEach(wire);
 }
 
-/** Fill in ENS names and wire inputs under root as they're painted. rpc: an Ethereum mainnet RPC URL. */
-export function watch(root: HTMLElement, rpc: string) {
+/** Fill in ENS names and wire inputs under root as they're painted. rpc: an Ethereum mainnet RPC URL, or a list
+ *  (the first that answers; a static clone passes /api/rpc then a public RPC). */
+export function watch(root: HTMLElement, rpc: string | string[]) {
+  const urls = (Array.isArray(rpc) ? rpc : [rpc]).filter(Boolean);
   ready ??= Promise.all([import("viem"), import("viem/ens")]).then(([viem, ens]) => {
     v = { ...viem, normalize: ens.normalize };
     // viem's mainnet, the ENS parts only (importing viem/chains pulls in every chain, 500 KB)
     const chain = viem.defineChain({ id: 1, name: "Ethereum", nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-      rpcUrls: { default: { http: [rpc] } },
+      rpcUrls: { default: { http: urls } },
       contracts: { ensUniversalResolver: { address: "0xeeeeeeee14d718c2b47d9923deab1335e144eeee", blockCreated: 23_085_558 },
         multicall3: { address: "0xca11bde05977b3631167028862be2a173976ca11", blockCreated: 14_353_601 } } });
-    client = viem.createPublicClient({ chain, transport: viem.http(rpc, { retryCount: 3 }) }) as PublicClient;
+    const transport = urls.length > 1
+      ? viem.fallback(urls.map((u) => viem.http(u, { retryCount: 0, timeout: 8_000 })))
+      : viem.http(urls[0], { retryCount: 3 });
+    client = viem.createPublicClient({ chain, transport }) as PublicClient;
   }, () => {});
   fill(root);
   new MutationObserver(() => fill(root)).observe(root, { childList: true, subtree: true });

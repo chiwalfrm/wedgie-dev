@@ -2,10 +2,11 @@
 // over WalletConnect: a phone wallet, Safe{Wallet}); the last one used is on top. The site has no React: this module (React, wagmi, RainbowKit) is loaded only when needed and mounts one hidden root.
 // It hands back the connected wallet's EIP-1193 provider, which safe.ts uses like window.ethereum.
 // Wallets as in Scaffold-ETH (wagmiConnectors): Rainbow, MetaMask, Coinbase, WalletConnect (any other), plus
-// whatever other wallet this browser has (injected). Reads go through /api/rpc (Alchemy), never a public RPC.
+// whatever other wallet this browser has (injected). Reads go through /api/rpc (Alchemy), then each chain's public RPC if /api/rpc isn't there.
 import { createElement as h, useEffect } from "react";
 import { createRoot } from "react-dom/client";
-import { WagmiProvider, createConfig, http, useAccount } from "wagmi";
+import { WagmiProvider, createConfig, fallback, http, useAccount } from "wagmi";
+import { PUBLIC_RPC } from "./public-rpc";
 import { getAccount, reconnect, disconnect as wDisconnect } from "wagmi/actions";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RainbowKitProvider, connectorsForWallets, useConnectModal, lightTheme } from "@rainbow-me/rainbowkit";
@@ -19,7 +20,10 @@ const connectors = connectorsForWallets(
   [{ groupName: "Wallets", wallets: [rainbowWallet, metaMaskWallet, coinbaseWallet, walletConnectWallet, safeWallet, injectedWallet] }],
   { appName: "wedgie", projectId },
 );
-const config = createConfig({ chains, connectors, transports: Object.fromEntries(chains.map((c) => [c.id, http(`${location.origin}/api/rpc?chain=${c.id}`)])) as any, ssr: false });
+const config = createConfig({ chains, connectors, transports: Object.fromEntries(chains.map((c) => [c.id, fallback([
+  http(`${location.origin}/api/rpc?chain=${c.id}`),
+  http(PUBLIC_RPC[c.id]),
+])])) as any, ssr: false });
 
 let open: (() => void) | undefined;
 let waiting: { res: (p: any) => void; rej: (e: Error) => void } | null = null;
